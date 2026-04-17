@@ -1,94 +1,137 @@
-// app.js
 const express = require('express');
 const mongoose = require('mongoose');
 const nodemailer = require('nodemailer');
-const cors = require('cors'); // 必須安裝 cors: npm install cors
-require('dotenv').config(); // 讀取環境變數
+const cors = require('cors');
+const crypto = require('crypto');
+require('dotenv').config();
 
 const app = express();
 app.use(express.json());
-app.use(cors()); // 允許前端跨域請求
+app.use(cors());
 
-// 改成讀取 process.env.MONGO_URI
 mongoose.connect(process.env.MONGO_URI)
   .then(() => console.log('雲端資料庫連線成功'))
   .catch(err => console.log('資料庫連線失敗:', err));
 
-// 使用者 Schema
+// 👑 設定最高管理員信箱
+const ADMIN_EMAILS =['fab2ci@gmail.com', '另一個管理員@gmail.com'];
+
+// 1. 修改 Schema：新增 password 與 salt (用於密碼加密)
 const userSchema = new mongoose.Schema({
   email: { type: String, unique: true },
+  password: { type: String }, // 密碼雜湊值
+  salt: { type: String },     // 密碼專屬隨機鹽
   verified: { type: Boolean, default: false },
   code: String,
   codeExpires: Date,
+  sessionToken: String, 
+  role: { type: String, default: 'user' },
+  lastLoginAt: Date, 
   createdAt: { type: Date, default: Date.now }
 });
 const User = mongoose.model('User', userSchema);
 
-// 郵件寄送設定 (請替換為您的信箱與應用程式密碼)
 const transporter = nodemailer.createTransport({
   service: 'gmail',
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS
-  }
+  auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
 });
 
-// API 1: 發送 6 位數驗證碼
-app.post('/api/auth/send', async (req, res) => {
+// 密碼加密函式 (PBKDF2 演算法)
+function hashPassword(password, salt) {
+  return crypto.pbkdf2Sync(password, salt, 1000, 64, 'sha512').toString('hex');
+}
+
+// === API 1: 登入或註冊請求 (整合密碼) ===
+app.post('/api/auth/login', async (req, res) => {
   try {
-    const { email } = req.body;
-    const code = Math.floor(100000 + Math.random() * 900000).toString(); // 產生 6 位數
-    const expires = new Date(Date.now() + 10 * 60000); // 10分鐘有效
+    const { email, password } = req.body;
+    if (!email || !password) return res.status(400).json({ success: false, message: '請填寫信箱與密碼' });
 
     let user = await User.findOne({ email });
-    if (!user) {
-      user = new User({ email, code, codeExpires: expires });
+
+    if (user) {
+      // 📝 帳號已存在 -> 驗證密碼
+      const hashedInput = hashPassword(password, user.salt);
+      if (hashedInput !== user.password) {
+        return res.status(401).json({ success: false, message: '密碼錯誤' });
+      }
+
+      if (user.verified) {
+        // 密碼正確且已驗證過 -> 瞬間登入，核發新通行證
+        user.sessionToken = crypto.randomBytes(16).toString('hex');
+        user.lastLoginAt = new Date();
+        await user.save();
+        return res.json({ success: true, message: '登入成功', user, token: user.sessionToken, directLogin: true });
+      }
     } else {
-      user.code = code;
-      user.codeExpires = expires;
+      // 📝 帳號不存在 -> 執行註冊，加密密碼並儲存
+      const salt = crypto.randomBytes(16).toString('hex');
+      const hashedPassword = hashPassword(password, salt);
+      const userRole = ADMIN_EMAILS.includes(email) ? 'admin' : 'user';
+      
+      user = new User({ email, password: hashedPassword, salt, role: userRole });
     }
+
+    // 尚未驗證 (新註冊或之前沒點驗證碼) -> 寄送驗證信
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const expires = new Date(Date.now() + 10 * 60000);
+    user.code = code;
+    user.codeExpires = expires;
     await user.save();
 
     await transporter.sendMail({
-      from: '您的寄件信箱@gmail.com',
+      from: process.env.EMAIL_USER,
       to: email,
-      subject: '外送記帳 APP - 登入驗證碼',
-      html: `<div style="padding:20px; font-family:sans-serif;">
-               <h2>您的登入驗證碼為：<span style="color:#FF6B35; font-size:32px; letter-spacing:4px;">${code}</span></h2>
-               <p>請在 10 分鐘內於 APP 輸入此驗證碼完成登入。</p>
-             </div>`
+      subject: '外送記帳 APP - 帳號驗證碼',
+      html: `<div style="padding:20px; font-family:sans-serif;"><h2>您的驗證碼為：<span style="color:#FF6B35; font-size:32px; letter-spacing:4px;">${code}</span></h2><p>請在 10 分鐘內於 APP 輸入此驗證碼完成驗證。</p></div>`
     });
 
-    res.json({ success: true, message: '驗證碼已寄出' });
+    // 回傳 directLogin: false，告訴前端要顯示「輸入驗證碼」的畫面
+    res.json({ success: true, message: '驗證碼已寄出', directLogin: false });
+
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// API 2: 驗證驗證碼
+// === API 2: 驗證驗證碼 ===
 app.post('/api/auth/verify', async (req, res) => {
   try {
     const { email, code } = req.body;
     const user = await User.findOne({ email });
     if (!user) return res.status(404).json({ success: false, message: '找不到帳號' });
-    
     if (user.code !== code || new Date() > user.codeExpires) {
       return res.status(400).json({ success: false, message: '驗證碼錯誤或已過期' });
     }
     
     user.verified = true;
-    user.code = null; // 驗證後清空
+    user.code = null; 
+    user.sessionToken = crypto.randomBytes(16).toString('hex');
+    user.lastLoginAt = new Date();
     await user.save();
     
-    res.json({ success: true, message: '登入成功', user });
+    res.json({ success: true, message: '登入成功', user, token: user.sessionToken });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// API 3: 管理員取得所有註冊用戶清單
-app.get('/api/admin/users', async (req, res) => {
+// === API 3: 檢查帳號存活與共用踢下線 ===
+app.post('/api/auth/check', async (req, res) => {
+  const { email, token } = req.body;
+  const user = await User.findOne({ email });
+  if (!user || !user.verified) return res.json({ active: false, reason: 'deleted' });
+  if (user.sessionToken !== token) return res.json({ active: false, reason: 'kicked', kickedAt: user.lastLoginAt });
+  res.json({ active: true });
+});
+
+// === API 4: 管理員取得清單 ===
+app.post('/api/admin/users', async (req, res) => {
   try {
+    const { adminEmail, token } = req.body;
+    const admin = await User.findOne({ email: adminEmail, sessionToken: token, role: 'admin' });
+    if (!admin) return res.status(403).json({ success: false, message: '權限不足或通行證失效' });
+
     const users = await User.find().sort({ createdAt: -1 });
     res.json({ success: true, users });
   } catch (err) {
@@ -96,23 +139,19 @@ app.get('/api/admin/users', async (req, res) => {
   }
 });
 
-// API 4: 管理員刪除/封鎖帳號
-app.delete('/api/admin/users/:email', async (req, res) => {
+// === API 5: 管理員刪除帳號 ===
+app.post('/api/admin/delete', async (req, res) => {
   try {
-    await User.deleteOne({ email: req.params.email });
+    const { adminEmail, token, targetEmail } = req.body;
+    const admin = await User.findOne({ email: adminEmail, sessionToken: token, role: 'admin' });
+    if (!admin) return res.status(403).json({ success: false, message: '權限不足' });
+
+    await User.deleteOne({ email: targetEmail });
     res.json({ success: true, message: '帳號已永久刪除' });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 });
 
-// API 5: 檢查帳號是否存活 (前端每次操作前可驗證)
-app.post('/api/auth/check', async (req, res) => {
-  const user = await User.findOne({ email: req.body.email });
-  if (user && user.verified) res.json({ active: true });
-  else res.json({ active: false });
-});
-
-// 雲端伺服器會自動分配 PORT
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`伺服器運行中，PORT: ${PORT}`));
