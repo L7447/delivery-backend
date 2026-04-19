@@ -14,7 +14,7 @@ mongoose.connect(process.env.MONGO_URI)
   .catch(err => console.log('資料庫連線失敗:', err));
 
 // 👑 設定最高管理員信箱
-const ADMIN_EMAILS =['fab2ci@gmail.com', '另一個管理員@gmail.com'];
+const ADMIN_EMAILS =['cws38721@gmail.com', '另一個管理員@gmail.com'];
 
 // 1. 修改 Schema：新增 password 與 salt (用於密碼加密)
 const userSchema = new mongoose.Schema({
