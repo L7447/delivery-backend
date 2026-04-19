@@ -125,6 +125,17 @@ app.post('/api/auth/check', async (req, res) => {
   res.json({ active: true });
 });
 
+// === API 3.5: 公開的系統註冊統計 (所有人都能看) ===
+app.get('/api/stats', async (req, res) => {
+  try {
+    const total = await User.countDocuments();
+    const verified = await User.countDocuments({ verified: true });
+    res.json({ success: true, total, verified });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // === API 4: 管理員取得清單 ===
 app.post('/api/admin/users', async (req, res) => {
   try {
